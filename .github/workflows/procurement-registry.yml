@@ -1,0 +1,110 @@
+name: Windows build and startup test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      request_signature:
+        description: Request approved SignPath signing after all tests pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: procurement-registry
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install exact developer test dependencies
+        run: python -m pip install --require-hashes -r procurement_app/requirements-portable.lock.txt
+      - name: Offline source regression checks
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$pwd/procurement_app"
+          foreach ($script in @('verify_app.py','verify_parallel.py','verify_tender_flow.py','verify_tender_search.py','verify_retries.py')) {
+            python $script
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Build the final Windows executable
+        run: python build_single_file.py
+      - name: Check the complete payload and metadata
+        run: python verify_single_file.py
+      - name: Execute the Windows EXE, reuse the cache, and repair a damaged asset
+        shell: pwsh
+        run: ./verify_windows_native.ps1
+      - name: Upload tested unsigned EXE
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: procurement-registry-unsigned
+          path: procurement-registry/outputs/single_file/ProcurementRegistry.exe
+          if-no-files-found: error
+      - name: Upload build report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: procurement-registry-build-report
+          path: procurement-registry/outputs/single_file/build_report.json
+
+  sign:
+    needs: windows
+    if: github.event_name == 'workflow_dispatch' && inputs.request_signature && github.ref == 'refs/heads/main' && vars.SIGNPATH_ENABLED == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    environment: code-signing
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Validate signing configuration
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          foreach ($name in @('SIGNPATH_API_TOKEN','SIGNPATH_ORGANIZATION_ID','SIGNPATH_PROJECT_SLUG','SIGNPATH_SIGNING_POLICY_SLUG')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing signing configuration: $name" }
+          }
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.windows.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+      - name: Verify Authenticode before labeling the file signed
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem signed -Recurse -Filter ProcurementRegistry.exe
+          if ($files.Count -ne 1) { throw 'Expected exactly one signed EXE' }
+          $signature = Get-AuthenticodeSignature $files[0].FullName
+          if ($signature.Status -ne 'Valid') { throw "Invalid signature status: $($signature.Status)" }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: procurement-registry-signed
+          path: signed/**/ProcurementRegistry.exe
+          if-no-files-found: error
